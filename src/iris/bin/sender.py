@@ -14,6 +14,7 @@ import gevent
 import signal
 import setproctitle
 import copy
+from sqlalchemy import text
 
 from collections import defaultdict
 from iris.plugins import init_plugins
@@ -364,7 +365,7 @@ def create_messages(msg_info):
                 while True:
                     retries += 1
                     try:
-                        cursor.execute(INSERT_MESSAGE_SQL,
+                        cursor.execute(text(INSERT_MESSAGE_SQL),
                                        (plan_notification['plan_id'], plan_notification_id, incident_id,
                                         application_id, target_id, priority_id, body))
                         connection.commit()
@@ -408,10 +409,10 @@ def deactivate():
     # this deadlocks sometimes. try until it doesn't.
     for i in range(1, max_retries + 1):
         try:
-            cursor.execute(GET_INACTIVE_IDS_SQL)
+            cursor.execute(text(GET_INACTIVE_IDS_SQL))
             ids = tuple(r[0] for r in cursor)
             if ids:
-                cursor.execute(INACTIVE_SQL, (ids,))
+                cursor.execute(text(INACTIVE_SQL), (ids,))
                 connection.commit()
                 break
         except Exception:
@@ -437,7 +438,7 @@ def escalate():
 
     connection = db.engine.raw_connection()
     cursor = connection.cursor()
-    cursor.execute(NEW_INCIDENTS)
+    cursor.execute(text(NEW_INCIDENTS))
 
     escalations = {}
     incident_per_plan_cnt = {}
@@ -521,7 +522,7 @@ def escalate():
     # then, fetch message count for current incidents
     msg_count = 0
     cursor = connection.cursor(db.dict_cursor)
-    cursor.execute(QUEUE_SQL)
+    cursor.execute(text(QUEUE_SQL))
     msg_info = []
     for n in cursor.fetchall():
         if n['count'] < n['max']:
@@ -554,10 +555,10 @@ def escalate():
                         # no message created due to role look up failure, reset step to
                         # 0 for retry
                         step = 0
-                    cursor.execute(UPDATE_INCIDENT_SQL, (step, incident_id))
+                    cursor.execute(text(UPDATE_INCIDENT_SQL), (step, incident_id))
                 else:
                     logger.error('plan id %d has no steps, incident id %d is invalid', plan_id, incident_id)
-                    cursor.execute(INVALIDATE_INCIDENT, incident_id)
+                    cursor.execute(text(INVALIDATE_INCIDENT), incident_id)
 
                 connection.commit()
             except Exception:
@@ -583,7 +584,7 @@ def aggregate(now):
     start_aggregations = time.time()
     connection = db.engine.raw_connection()
     cursor = connection.cursor()
-    cursor.execute('SELECT `id` FROM `message` WHERE active=1')
+    cursor.execute(text('SELECT `id` FROM `message` WHERE active=1'))
     all_actives = {r[0] for r in cursor}
     cursor.close()
     connection.close()
@@ -636,9 +637,9 @@ def poll():
     connection = db.engine.raw_connection()
     cursor = connection.cursor(db.dict_cursor)
     if messages:
-        cursor.execute(UNSENT_MESSAGES_SQL + ' AND `msg`.`id` NOT IN %s', [tuple(messages)])
+        cursor.execute(text(UNSENT_MESSAGES_SQL + ' AND `msg`.`id` NOT IN %s'), [tuple(messages)])
     else:
-        cursor.execute(UNSENT_MESSAGES_SQL)
+        cursor.execute(text(UNSENT_MESSAGES_SQL))
 
     new_msg_count = cursor.rowcount
     queued_msg_cnt = len(messages)
@@ -741,12 +742,12 @@ def set_target_fallback_mode(message):
     try:
         connection = db.engine.raw_connection()
         cursor = connection.cursor()
-        cursor.execute('''SELECT `destination`, `mode`.`name`, `mode`.`id`
-                          FROM `target`
-                          JOIN `target_contact` ON `target_contact`.`target_id` = `target`.`id`
-                          JOIN `mode` ON `mode`.`id` = `target_contact`.`mode_id`
-                          WHERE `target`.`name` = %s AND `mode`.`name` = %s''',
-                       (message['target'], target_fallback_mode))
+        query = '''SELECT `destination`, `mode`.`name`, `mode`.`id`
+                   FROM `target`
+                   JOIN `target_contact` ON `target_contact`.`target_id` = `target`.`id`
+                   JOIN `mode` ON `mode`.`id` = `target_contact`.`mode_id`
+                   WHERE `target`.`name` = %s AND `mode`.`name` = %s'''
+        cursor.execute(text(query), (message['target'], target_fallback_mode))
         [(destination, mode, mode_id)] = cursor
         cursor.close()
         connection.close()
@@ -771,7 +772,7 @@ def set_target_fallback_mode(message):
 
 def set_target_contact_by_priority(message):
     session = db.Session()
-    result = session.execute('''
+    query = '''
               SELECT `target_contact`.`destination` AS dest, `mode`.`name` AS mode_name, `mode`.`id` AS mode_id
               FROM `mode`
               JOIN `target` ON `target`.`name` = :target
@@ -816,7 +817,8 @@ def set_target_contact_by_priority(message):
                             AND   `application_mode`.`application_id` = `application`.`id`)
                 -- And ensure this only works for users
                 AND `target_type`.`name` = 'user'
-        ''', message)
+        '''
+    result = session.execute(text(query), message)
 
     try:
         [(destination, mode, mode_id)] = result
@@ -858,7 +860,7 @@ def set_target_contact(message):
         cursor = connection.cursor()
         for t in message['target']:
             try:
-                cursor.execute(destination_query, {'target': t['target'], 'mode_id': message.get('mode_id'), 'mode': message.get('mode')})
+                cursor.execute(text(destination_query), {'target': t['target'], 'mode_id': message.get('mode_id'), 'mode': message.get('mode')})
                 if t.get('bcc'):
                     message['bcc_destination'].append(cursor.fetchone()[0])
                 else:
@@ -875,7 +877,7 @@ def set_target_contact(message):
             # mode_id set by API
             connection = db.engine.raw_connection()
             cursor = connection.cursor()
-            cursor.execute(destination_query, {'target': message['target'], 'mode_id': message.get('mode_id'), 'mode': message.get('mode')})
+            cursor.execute(text(destination_query), {'target': message['target'], 'mode_id': message.get('mode_id'), 'mode': message.get('mode')})
             message['destination'] = cursor.fetchone()[0]
             cursor.close()
             connection.close()
@@ -884,23 +886,25 @@ def set_target_contact(message):
             connection = db.engine.raw_connection()
             cursor = connection.cursor()
             # get user category overrides if they exist
-            cursor.execute('''
+            query = '''
                 SELECT `mode`.`id`, `mode`.`name` FROM `category_override`
                 JOIN `target` ON `target`.`id` = `category_override`.`user_id`
                 JOIN `mode` ON `mode`.`id` = `category_override`.`mode_id`
                 WHERE `target`.`name` = %(target)s AND `category_override`.`category_id` = %(category_id)s
-                ''', {'target': message['target'], 'category_id': message['category_id']})
+            '''
+            cursor.execute(text(query), {'target': message['target'], 'category_id': message['category_id']})
             override_mode = cursor.fetchone()
             if override_mode:
                 message['mode_id'] = override_mode[0]
                 message['mode'] = override_mode[1]
             else:
                 # use app default for category
-                cursor.execute('''
-                SELECT `mode`.`id`, `mode`.`name` FROM `notification_category`
-                JOIN `mode` ON `mode`.`id` = `notification_category`.`mode_id`
-                WHERE `notification_category`.`id` = %(category_id)s
-                ''', {'category_id': message['category_id']})
+                query = '''
+                    SELECT `mode`.`id`, `mode`.`name` FROM `notification_category`
+                    JOIN `mode` ON `mode`.`id` = `notification_category`.`mode_id`
+                    WHERE `notification_category`.`id` = %(category_id)s
+                '''
+                cursor.execute(text(query), {'category_id': message['category_id']})
                 override_mode = cursor.fetchone()
 
                 if override_mode:
@@ -909,7 +913,7 @@ def set_target_contact(message):
                 else:
                     message['mode_id'] = message['category_mode_id']
                     message['mode'] = message['category_mode']
-            cursor.execute('''
+            query = '''
                 SELECT `destination` FROM `target_contact`
                 JOIN `target` ON `target`.`id` = `target_contact`.`target_id`
                 JOIN `target_type` on `target_type`.`id` = `target`.`type_id`
@@ -917,7 +921,8 @@ def set_target_contact(message):
                 AND `target_type`.`name` = 'user'
                 AND `target_contact`.`mode_id` = %(mode_id)s
                 LIMIT 1
-                ''', {'target': message['target'], 'mode_id': message['mode_id']})
+            '''
+            cursor.execute(text(query), {'target': message['target'], 'mode_id': message['mode_id']})
             message['destination'] = cursor.fetchone()[0]
             cursor.close()
             connection.close()
@@ -943,7 +948,7 @@ def render(message):
             # message content is already in DB
             connection = db.engine.raw_connection()
             cursor = connection.cursor()
-            cursor.execute('SELECT `body`, `subject` FROM `message` WHERE `id` = %s',
+            cursor.execute(text('SELECT `body`, `subject` FROM `message` WHERE `id` = %s'),
                            message['message_id'])
             msg_content = cursor.fetchone()
             message['body'], message['subject'] = msg_content[0], msg_content[1]
@@ -1036,7 +1041,7 @@ def mark_message_as_sent(message):
     # this deadlocks sometimes. try until it doesn't.
     for i in range(1, max_retries + 1):
         try:
-            cursor.execute(sql, params)
+            cursor.execute(text(sql), params)
             connection.commit()
             break
         except DataError:
@@ -1072,7 +1077,7 @@ def mark_message_as_sent(message):
     # this deadlocks sometimes. try until it doesn't.
     for i in range(1, max_retries + 1):
         try:
-            cursor.execute(UPDATE_MESSAGE_BODY_SQL, (message['body'], message['subject'], update_ids))
+            cursor.execute(text(UPDATE_MESSAGE_BODY_SQL), (message['body'], message['subject'], update_ids))
             connection.commit()
             break
         except DataError:
@@ -1110,10 +1115,10 @@ def update_message_sent_status(message, status):
     while True:
         retries += 1
         try:
-            session.execute('''INSERT INTO `generic_message_sent_status` (`message_id`, `status`)
-                        VALUES (:message_id, :status)
-                        ON DUPLICATE KEY UPDATE `status` =  :status''',
-                            {'message_id': message_id, 'status': status})
+            query = '''INSERT INTO `generic_message_sent_status` (`message_id`, `status`)
+                      VALUES (:message_id, :status)
+                      ON DUPLICATE KEY UPDATE `status` =  :status'''
+            session.execute(text(query), {'message_id': message_id, 'status': status})
             session.commit()
         except Exception:
             logger.warning('Failed setting message sent status for message %s (Try %s/%s)', message_id, retries, max_retries)
@@ -1141,7 +1146,7 @@ def mark_message_has_no_contact(message):
     while True:
         retries += 1
         try:
-            cursor.execute('UPDATE `message` set `active`=0 WHERE `id`=%s',
+            cursor.execute(text('UPDATE `message` SET `active`=0 WHERE `id`=%s'),
                            message_id)
             connection.commit()
             cursor.close()
@@ -1521,7 +1526,7 @@ def prune_old_audit_logs_worker():
         try:
             connection = db.engine.raw_connection()
             cursor = connection.cursor()
-            cursor.execute(PRUNE_OLD_AUDIT_LOGS_SQL)
+            cursor.execute(text(PRUNE_OLD_AUDIT_LOGS_SQL))
             connection.commit()
             cursor.close()
         except Exception:
@@ -1605,10 +1610,11 @@ def modify_restricted_sms(message):
         connection = db.engine.raw_connection()
         cursor = connection.cursor()
         # only replace messages for users that have opted in
-        cursor.execute('''SELECT count(`mode_template_override`.`target_id`)
+        query = '''SELECT count(`mode_template_override`.`target_id`)
             FROM `mode_template_override` JOIN `target_contact`
             ON `mode_template_override`.`target_id` = `target_contact`.`target_id`
-            WHERE `target_contact`.`destination` = %s and `target_contact`.`mode_id` = %s''', (destination, mode_id))
+            WHERE `target_contact`.`destination` = %s and `target_contact`.`mode_id` = %s'''
+        cursor.execute(text(query), (destination, mode_id))
         result = cursor.fetchone()[0]
         connection.close()
         if result:
