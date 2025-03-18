@@ -34,7 +34,7 @@ setuptools.setup(
         'google-api-python-client==1.4.2',
         'oauth2client==1.4.12',
         'slackclient',
-        'PyYAML',
+        'PyYAML==5.4.1',
         'greenlet==0.4.16',
         'gevent==1.5.0',
         'falcon==1.4.1',
